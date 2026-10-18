@@ -67,7 +67,19 @@ impl<S: Socket> Socket for RustlsSocket<S> {
     }
 
     fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_complete_io(cx)
+        // Flushing must drain writes, not wait for unsolicited peer data.
+        // complete_io() may also return after only part of a TLS record is sent.
+        while self.state.wants_write() {
+            match self.state.write_tls(&mut self.inner) {
+                Ok(0) => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    futures_util::ready!(self.inner.poll_ready(cx))?;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -76,7 +88,7 @@ impl<S: Socket> Socket for RustlsSocket<S> {
             self.close_notify_sent = true;
         }
 
-        futures_util::ready!(self.poll_complete_io(cx))?;
+        futures_util::ready!(self.poll_flush(cx))?;
 
         // Server can close socket as soon as it receives the connection shutdown request.
         // We shouldn't expect it to stick around for the TLS session to close cleanly.
@@ -333,5 +345,121 @@ impl ServerCertVerifier for NoHostnameTlsVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.verifier.supported_verify_schemes()
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        feature = "_tls-rustls-ring-webpki",
+        feature = "_tls-rustls-ring-native-roots"
+    )
+))]
+mod flush_tests {
+    use super::*;
+    use rustls::{ServerConfig, ServerConnection};
+
+    struct Backpressure {
+        writable: usize,
+    }
+    impl Socket for Backpressure {
+        fn try_read(&mut self, _: &mut dyn ReadBuf) -> io::Result<usize> {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+        fn try_write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.writable == 0 {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let n = self.writable.min(buf.len());
+            self.writable -= n;
+            Ok(n)
+        }
+        fn poll_read_ready(&mut self, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_write_ready(&mut self, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_shutdown(&mut self, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn socket(writable: usize) -> RustlsSocket<Backpressure> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client_config = ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(DummyTlsVerifier {
+                provider: provider.clone(),
+            }))
+            .with_no_client_auth();
+        let cert =
+            CertificateDer::from_pem_slice(include_bytes!("../../../../tests/certs/server.crt"))
+                .unwrap();
+        let key =
+            PrivateKeyDer::from_pem_slice(include_bytes!("../../../../tests/keys/server.key"))
+                .unwrap();
+        let server_config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let mut client = ClientConnection::new(
+            Arc::new(client_config),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
+        loop {
+            let mut wire = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut wire).unwrap();
+            }
+            if !wire.is_empty() {
+                server.read_tls(&mut wire.as_slice()).unwrap();
+                server.process_new_packets().unwrap();
+            }
+            wire.clear();
+            while server.wants_write() {
+                server.write_tls(&mut wire).unwrap();
+            }
+            if !wire.is_empty() {
+                client.read_tls(&mut wire.as_slice()).unwrap();
+                client.process_new_packets().unwrap();
+            }
+            if !client.is_handshaking() && !server.is_handshaking() && !client.wants_write() {
+                break;
+            }
+        }
+        RustlsSocket {
+            inner: StdSocket::new(Backpressure { writable }),
+            state: client,
+            close_notify_sent: false,
+        }
+    }
+
+    #[test]
+    fn empty_flush_does_not_wait_for_unsolicited_server_data() {
+        let mut socket = socket(0);
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(matches!(socket.poll_flush(&mut cx), Poll::Ready(Ok(()))));
+        socket.inner.socket.writable = usize::MAX;
+        assert!(matches!(socket.poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
+        assert!(matches!(socket.poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
+    }
+
+    #[test]
+    fn partial_tls_write_must_finish_before_flush_returns() {
+        let mut socket = socket(1);
+        socket.state.writer().write_all(b"query").unwrap();
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(socket.poll_flush(&mut cx).is_pending());
+        assert!(socket.state.wants_write());
+        socket.inner.socket.writable = usize::MAX;
+        assert!(matches!(socket.poll_flush(&mut cx), Poll::Ready(Ok(()))));
+        assert!(!socket.state.wants_write());
     }
 }
