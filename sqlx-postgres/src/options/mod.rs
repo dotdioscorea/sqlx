@@ -30,6 +30,7 @@ pub struct PgConnectOptions {
     pub(crate) log_settings: LogSettings,
     pub(crate) extra_float_digits: Option<Cow<'static, str>>,
     pub(crate) options: Option<String>,
+    pub(crate) response_bytes: Option<fn(&str, usize)>,
 }
 
 impl Default for PgConnectOptions {
@@ -39,6 +40,13 @@ impl Default for PgConnectOptions {
 }
 
 impl PgConnectOptions {
+    /// Observe received PostgreSQL protocol message bytes, attributed to the SQL
+    /// statement (bind values are never supplied). TLS framing is excluded.
+    pub fn observe_response_bytes(mut self, observer: fn(&str, usize)) -> Self {
+        self.response_bytes = Some(observer);
+        self
+    }
+
     /// Create a default set of connection options populated from the current environment.
     ///
     /// This behaves as if parsed from the connection string `postgres://`
@@ -90,6 +98,7 @@ impl PgConnectOptions {
             extra_float_digits: Some("2".into()),
             log_settings: Default::default(),
             options: var("PGOPTIONS").ok(),
+            response_bytes: None,
         }
     }
 

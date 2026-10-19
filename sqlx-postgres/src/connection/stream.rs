@@ -38,9 +38,15 @@ pub struct PgStream {
     pub(crate) parameter_statuses: BTreeMap<String, String>,
 
     pub(crate) server_version_num: Option<u32>,
+    pub(crate) current_query: String,
+    response_bytes: Option<fn(&str, usize)>,
 }
 
 impl PgStream {
+    pub(super) fn response_bytes_enabled(&self) -> bool {
+        self.response_bytes.is_some()
+    }
+
     pub(super) async fn connect(options: &PgConnectOptions) -> Result<Self, Error> {
         let socket_result = match options.fetch_socket() {
             Some(ref path) => net::connect_uds(path, MaybeUpgradeTls(options)).await?,
@@ -54,6 +60,8 @@ impl PgStream {
             notifications: None,
             parameter_statuses: BTreeMap::default(),
             server_version_num: None,
+            current_query: "connect".into(),
+            response_bytes: options.response_bytes,
         })
     }
 
@@ -79,7 +87,7 @@ impl PgStream {
     pub(crate) async fn recv_unchecked(&mut self) -> Result<ReceivedMessage, Error> {
         // NOTE: to not break everything, this should be cancel-safe;
         // DO NOT modify `buf` unless a full message has been read
-        self.inner
+        let message = self.inner
             .try_read(|buf| {
                 // all packets in postgres start with a 5-byte header
                 // this header contains the message type and the total length of the message
@@ -115,7 +123,11 @@ impl PgStream {
 
                 Ok(ControlFlow::Break(ReceivedMessage { format, contents }))
             })
-            .await
+            .await?;
+        if let Some(observe) = self.response_bytes {
+            observe(&self.current_query, message.contents.len() + 5);
+        }
+        Ok(message)
     }
 
     // Get the next message from the server

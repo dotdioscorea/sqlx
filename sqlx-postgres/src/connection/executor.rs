@@ -206,6 +206,9 @@ impl PgConnection {
 
         // before we continue, wait until we are "ready" to accept more queries
         self.wait_until_ready().await?;
+        if self.inner.stream.response_bytes_enabled() {
+            query.clone_into(&mut self.inner.stream.current_query);
+        }
 
         let mut metadata: Arc<PgStatementMetadata>;
 
