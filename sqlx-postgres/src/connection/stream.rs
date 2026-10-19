@@ -40,6 +40,7 @@ pub struct PgStream {
     pub(crate) server_version_num: Option<u32>,
     pub(crate) current_query: String,
     response_bytes: Option<fn(&str, usize)>,
+    counted_buffer: usize,
 }
 
 impl PgStream {
@@ -62,6 +63,7 @@ impl PgStream {
             server_version_num: None,
             current_query: "connect".into(),
             response_bytes: options.response_bytes,
+            counted_buffer: 0,
         })
     }
 
@@ -87,8 +89,20 @@ impl PgStream {
     pub(crate) async fn recv_unchecked(&mut self) -> Result<ReceivedMessage, Error> {
         // NOTE: to not break everything, this should be cancel-safe;
         // DO NOT modify `buf` unless a full message has been read
-        let message = self.inner
+        let observer = self.response_bytes;
+        let query = &self.current_query;
+        let counted = &mut self.counted_buffer;
+        self.inner
             .try_read(|buf| {
+                // Count new bytes when read, including an incomplete row whose
+                // command is later cancelled. Buffered messages are counted once.
+                if let Some(observe) = observer {
+                    let new = buf.len().saturating_sub(*counted);
+                    *counted = buf.len();
+                    if new != 0 {
+                        observe(query, new);
+                    }
+                }
                 // all packets in postgres start with a 5-byte header
                 // this header contains the message type and the total length of the message
                 let Some(mut header) = buf.get(..5) else {
@@ -112,6 +126,10 @@ impl PgStream {
 
                 // `buf` SHOULD NOT be modified ABOVE this line
 
+                if observer.is_some() {
+                    *counted -= expected_len;
+                }
+
                 // pop off the format code since it's not counted in `message_len`
                 buf.advance(1);
 
@@ -123,11 +141,7 @@ impl PgStream {
 
                 Ok(ControlFlow::Break(ReceivedMessage { format, contents }))
             })
-            .await?;
-        if let Some(observe) = self.response_bytes {
-            observe(&self.current_query, message.contents.len() + 5);
-        }
-        Ok(message)
+            .await
     }
 
     // Get the next message from the server
