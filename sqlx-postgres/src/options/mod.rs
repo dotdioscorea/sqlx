@@ -31,6 +31,7 @@ pub struct PgConnectOptions {
     pub(crate) extra_float_digits: Option<Cow<'static, str>>,
     pub(crate) options: Option<String>,
     pub(crate) response_bytes: Option<fn(&str, usize)>,
+    pub(crate) protocol_round_trips: Option<fn(&str)>,
 }
 
 impl Default for PgConnectOptions {
@@ -44,6 +45,13 @@ impl PgConnectOptions {
     /// statement (bind values are never supplied). TLS framing is excluded.
     pub fn observe_response_bytes(mut self, observer: fn(&str, usize)) -> Self {
         self.response_bytes = Some(observer);
+        self
+    }
+
+    /// Observe each complete ReadyForQuery message, including prepare Syncs.
+    /// The label is the current query; startup uses `connect`.
+    pub fn observe_protocol_round_trips(mut self, observer: fn(&str)) -> Self {
+        self.protocol_round_trips = Some(observer);
         self
     }
 
@@ -99,6 +107,7 @@ impl PgConnectOptions {
             log_settings: Default::default(),
             options: var("PGOPTIONS").ok(),
             response_bytes: None,
+            protocol_round_trips: None,
         }
     }
 

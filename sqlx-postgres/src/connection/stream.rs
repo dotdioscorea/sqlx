@@ -40,12 +40,13 @@ pub struct PgStream {
     pub(crate) server_version_num: Option<u32>,
     pub(crate) current_query: String,
     response_bytes: Option<fn(&str, usize)>,
+    protocol_round_trips: Option<fn(&str)>,
     counted_buffer: usize,
 }
 
 impl PgStream {
     pub(super) fn response_bytes_enabled(&self) -> bool {
-        self.response_bytes.is_some()
+        self.response_bytes.is_some() || self.protocol_round_trips.is_some()
     }
 
     pub(super) async fn connect(options: &PgConnectOptions) -> Result<Self, Error> {
@@ -63,6 +64,7 @@ impl PgStream {
             server_version_num: None,
             current_query: "connect".into(),
             response_bytes: options.response_bytes,
+            protocol_round_trips: options.protocol_round_trips,
             counted_buffer: 0,
         })
     }
@@ -90,6 +92,7 @@ impl PgStream {
         // NOTE: to not break everything, this should be cancel-safe;
         // DO NOT modify `buf` unless a full message has been read
         let observer = self.response_bytes;
+        let ready = self.protocol_round_trips;
         let query = &self.current_query;
         let counted = &mut self.counted_buffer;
         self.inner
@@ -139,6 +142,11 @@ impl PgStream {
                 // cut off the length prefix
                 contents.advance(4);
 
+                if matches!(format, BackendMessageFormat::ReadyForQuery) {
+                    if let Some(observe) = ready {
+                        observe(query);
+                    }
+                }
                 Ok(ControlFlow::Break(ReceivedMessage { format, contents }))
             })
             .await
